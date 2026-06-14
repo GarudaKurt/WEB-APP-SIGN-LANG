@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>Sign Language Bridge</title>
+   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@300;400;600;700&display=swap" rel="stylesheet">
+   <style>
+      :root {
+        --ink:    #0f0f13;
+        --paper:  #f5f4ef;
+        --accent: #e84d3d;
+        --green:  #16a34a;
+        --blue:   #2563eb;
+      }
+      body { font-family: 'Sora', sans-serif; background: var(--paper); color: var(--ink); }
+      .topbar { background: var(--ink); color: white; border-bottom: 3px solid var(--accent); }
+      .mono   { font-family: 'Space Mono', monospace; }
+
+      /* Camera feed */
+      .camera-wrapper {
+        background: #000;
+        border: 2px solid var(--ink);
+        position: relative;
+        overflow: hidden;
+        aspect-ratio: 16/9;
+      }
+      .camera-wrapper img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+      .camera-overlay {
+        position: absolute;
+        bottom: 10px; left: 10px;
+        background: rgba(0,0,0,0.6);
+        color: #a3e635;
+        font-family: 'Space Mono', monospace;
+        font-size: 0.75rem;
+        padding: 4px 10px;
+        border-radius: 4px;
+      }
+
+      /* Detection result box */
+      .detection-box {
+        min-height: 140px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--ink);
+        color: white;
+        font-size: 3rem;
+        font-weight: 700;
+        letter-spacing: 2px;
+        text-align: center;
+        padding: 0 1rem;
+      }
+      .detection-box.flash { animation: flash 0.5s ease; }
+      @keyframes flash {
+        0%   { background: var(--blue); }
+        100% { background: var(--ink); }
+      }
+
+      /* FSL Mode buttons (camera footer) */
+      .mode-btn { font-family: 'Space Mono', monospace; font-size: 0.85rem; padding: 10px 20px; }
+      .mode-btn.active-mode { background: var(--accent) !important; border-color: var(--accent) !important; color: #fff !important; }
+
+      /* Log */
+      .log-body {
+        height: 140px;
+        overflow-y: auto;
+        background: #0f1117;
+        color: #a3e635;
+        font-family: 'Space Mono', monospace;
+        font-size: 0.78rem;
+        padding: 10px;
+      }
+   </style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<nav class="topbar navbar px-4">
+   <span class="navbar-brand mono fw-bold text-white">Sign Language Bridge</span>
+   <span class="mono text-secondary" id="fslModeLabel" style="font-size:0.85rem;">FSL: ALPHABET</span>
+</nav>
+
+<div class="container py-4">
+   <div class="row g-4">
+
+      <!-- LEFT: Camera + Mode Controls -->
+      <div class="col-lg-7">
+         <div class="card border-dark shadow-sm">
+            <div class="card-header fw-bold d-flex justify-content-between align-items-center">
+               <span>📷 FSL Camera</span>
+               <span class="text-muted small mono">live detection</span>
+            </div>
+            <div class="card-body p-0">
+               <div class="camera-wrapper">
+                  <img id="cameraFeed" alt="Camera Feed">
+                  <div class="camera-overlay" id="cameraStatus">● Live</div>
+               </div>
+            </div>
+            <div class="card-footer d-flex gap-2 flex-wrap justify-content-center">
+               <button class="btn btn-outline-dark mode-btn active-mode" id="btnAlphabet" onclick="setMode('ALPHABET')">ALPHABET</button>
+               <button class="btn btn-outline-dark mode-btn"             id="btnNumbers"  onclick="setMode('NUMBERS')">NUMBERS</button>
+               <button class="btn btn-outline-dark mode-btn"             id="btnPhrases"  onclick="setMode('PHRASES')">PHRASES</button>
+            </div>
+         </div>
+      </div>
+
+      <!-- RIGHT: Detection panel -->
+      <div class="col-lg-5 d-flex flex-column gap-4">
+         <div class="card border-dark shadow-sm">
+            <div class="card-header fw-bold">
+                Detected Sign
+               <span class="text-muted small float-end mono" id="detectionMode">ALPHABET</span>
+            </div>
+            <div class="card-body p-0">
+               <div class="detection-box" id="detectionBox">
+                  <span id="detectionText" class="text-secondary fs-5">Waiting...</span>
+               </div>
+            </div>
+         </div>
+      </div>
+
+      <!-- Activity Log -->
+      <div class="col-12">
+         <div class="card border-dark">
+            <div class="card-header fw-bold">
+               Activity Log
+               <span class="text-muted small float-end mono">real-time</span>
+            </div>
+            <div class="log-body" id="logBody">
+               <div>System initialized...</div>
+            </div>
+         </div>
+      </div>
+
+   </div>
+</div>
+
+<script>
+   // ── Logging ────────────────────────────────────────────────
+   function log(msg) {
+     const el = document.createElement("div");
+     el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+     const body = document.getElementById("logBody");
+     body.appendChild(el);
+     body.scrollTop = body.scrollHeight;
+   }
+
+   // ── FSL mode buttons ───────────────────────────────────────
+   const modeButtons = {
+     ALPHABET: document.getElementById("btnAlphabet"),
+     NUMBERS:  document.getElementById("btnNumbers"),
+     PHRASES:  document.getElementById("btnPhrases"),
+   };
+
+   function highlightMode(mode) {
+     Object.entries(modeButtons).forEach(([key, btn]) => {
+       btn.classList.toggle("active-mode", key === mode);
+     });
+     document.getElementById("fslModeLabel").textContent = `FSL: ${mode}`;
+     document.getElementById("detectionMode").textContent = mode;
+   }
+
+   async function setMode(mode) {
+     const res = await fetch("/set_fsl_mode", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({ mode })
+     });
+     const data = await res.json();
+     if (data.ok) {
+       highlightMode(mode);
+       document.getElementById("detectionText").textContent = "Waiting...";
+       log(`Mode changed to ${mode}`);
+     }
+   }
+
+   // ── FSL detection display ──────────────────────────────────
+   function showDetection(label, mode) {
+     const box   = document.getElementById("detectionBox");
+     const text  = document.getElementById("detectionText");
+
+     text.textContent = label;
+     text.className   = "fw-bold";
+
+     box.classList.remove("flash");
+     void box.offsetWidth;
+     box.classList.add("flash");
+
+     log(`[${mode}] Detected: "${label}"`);
+   }
+
+   // ── SSE ────────────────────────────────────────────────────
+   function startSSE() {
+     const es = new EventSource("/stream");
+
+     es.addEventListener("init", e => {
+       const d = JSON.parse(e.data);
+       if (d.fsl_label) showDetection(d.fsl_label, d.fsl_mode);
+       highlightMode(d.fsl_mode || "ALPHABET");
+       log("Connected to backend stream.");
+     });
+
+     es.addEventListener("fsl", e => {
+       const d = JSON.parse(e.data);
+       showDetection(d.label, d.mode);
+     });
+
+     es.addEventListener("frame", e => {
+       document.getElementById("cameraFeed").src =
+         "data:image/jpeg;base64," + e.data;
+     });
+
+     es.onerror = () => log("SSE connection lost — retrying…");
+   }
+
+   // ── Init ───────────────────────────────────────────────────
+   fetch("/get_state").then(r => r.json()).then(d => {
+     highlightMode(d.fsl_mode_current || "ALPHABET");
+   });
+
+   startSSE();
+   log("System initialized.");
+</script>
+</body>
+</html>

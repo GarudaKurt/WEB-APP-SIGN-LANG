@@ -1,15 +1,35 @@
+"""
+app.py
+------
+Flask web app for the Filipino Sign Language Detector.
+
+Adapted from main.py (desktop OpenCV version) — same MediaPipe
+HandLandmarker setup, normalization, and model prediction logic,
+but streams the camera feed + detection results to a web UI via
+Server-Sent Events (SSE) instead of cv2.imshow().
+
+Mode switching (ALPHABET / NUMBERS / PHRASES) is controlled by the
+web UI buttons via POST /set_fsl_mode.
+"""
+
+import base64
+import json
 import os
+import threading
 import time
 import urllib.request
-from collections import deque, Counter
 import warnings
+from collections import deque, Counter
 
 import cv2
 import joblib
 import mediapipe as mp
 import numpy as np
+from flask import Flask, Response, jsonify, render_template, request
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
+
+app = Flask(__name__)
 
 # ─────────────────────────────
 # Paths
@@ -41,14 +61,23 @@ PHRASE_CONFIDENCE_THRESHOLD = 0.70
 PHRASE_MOVEMENT_THRESHOLD = 0.00
 
 MOTION_HOLD_SECONDS = 2.0
-MENU_HOLD_SECONDS = 1.2
 
-MODE_MENU = "MENU"
 MODE_ALPHABET = "ALPHABET"
 MODE_NUMBERS = "NUMBERS"
 MODE_PHRASES = "PHRASES"
 
+VALID_MODES = {MODE_ALPHABET, MODE_NUMBERS, MODE_PHRASES}
+
 PHRASE_EXPECTED_FEATURES = SEQUENCE_LENGTH * PHRASE_MAX_HANDS * 21 * 3
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
+]
 
 # ─────────────────────────────
 # Download MediaPipe model if needed
@@ -61,15 +90,17 @@ if not os.path.exists(MODEL_PATH):
 # ─────────────────────────────
 # Load Classifiers
 # ─────────────────────────────
-if not os.path.exists(ALPHABET_MODEL_PATH):
-    print("No trained alphabet model found.")
-    print("Run collect_alphabet_data.py first, then train_alphabet_model.py.")
-    exit()
-
-alphabet_classifier = joblib.load(ALPHABET_MODEL_PATH)
-print("Alphabet model loaded.")
-
+alphabet_classifier = None
 motion_classifier = None
+number_classifier = None
+phrase_classifier = None
+phrase_model_compatible = False
+
+if os.path.exists(ALPHABET_MODEL_PATH):
+    alphabet_classifier = joblib.load(ALPHABET_MODEL_PATH)
+    print("Alphabet model loaded.")
+else:
+    print("WARNING: No trained alphabet model found at", ALPHABET_MODEL_PATH)
 
 if os.path.exists(MOTION_MODEL_PATH):
     motion_classifier = joblib.load(MOTION_MODEL_PATH)
@@ -77,16 +108,11 @@ if os.path.exists(MOTION_MODEL_PATH):
 else:
     print("No alphabet motion model found. J and Z movement detection disabled.")
 
-number_classifier = None
-
 if os.path.exists(NUMBER_MODEL_PATH):
     number_classifier = joblib.load(NUMBER_MODEL_PATH)
     print("Number model loaded. Number detection enabled.")
 else:
-    print("No number model found. Option 2 will open but detection is disabled.")
-
-phrase_classifier = None
-phrase_model_compatible = False
+    print("No number model found. Number detection disabled.")
 
 if os.path.exists(PHRASE_MODEL_PATH):
     phrase_classifier = joblib.load(PHRASE_MODEL_PATH)
@@ -108,15 +134,10 @@ if os.path.exists(PHRASE_MODEL_PATH):
         print("Phrase model is compatible with 2-hand phrase detection.")
     else:
         phrase_model_compatible = False
-        print("")
-        print("WARNING: Phrase model is not compatible with this 2-hand main.py.")
-        print(f"Expected features: {PHRASE_EXPECTED_FEATURES}")
-        print(f"Model features: {phrase_feature_count}")
-        print("This usually means the phrase model was trained using the old 1-hand phrase collector.")
-        print("Recollect phrase data using the 2-hand collect_phrase_data.py, then run train_phrase_model.py.")
-        print("")
+        print("WARNING: Phrase model is not compatible with 2-hand phrase detection.")
+        print(f"Expected features: {PHRASE_EXPECTED_FEATURES}, Model features: {phrase_feature_count}")
 else:
-    print("No phrase model found. Option 3 will open but detection is disabled.")
+    print("No phrase model found. Phrase detection disabled.")
 
 # ─────────────────────────────
 # MediaPipe Setup
@@ -125,15 +146,6 @@ BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
-
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17)
-]
 
 options = HandLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=MODEL_PATH),
@@ -144,14 +156,29 @@ options = HandLandmarkerOptions(
     min_tracking_confidence=0.5
 )
 
+landmarker = HandLandmarker.create_from_options(options)
+
+# ─────────────────────────────
+# Shared State
+# ─────────────────────────────
+state_lock = threading.Lock()
+state = {
+    "fsl_mode": MODE_ALPHABET,
+    "fsl_label": "",
+    "frame_jpeg_b64": None,
+}
+
 # ─────────────────────────────
 # Prediction Buffers
 # ─────────────────────────────
 alphabet_history = deque(maxlen=10)
 number_history = deque(maxlen=10)
 phrase_history = deque(maxlen=5)
-
 motion_buffer = deque(maxlen=SEQUENCE_LENGTH)
+
+last_motion_letter = ""
+last_motion_time = 0
+
 
 # ─────────────────────────────
 # Landmark Helpers
@@ -165,7 +192,6 @@ def normalize_landmarks(hand_landmarks):
     scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
 
     features = []
-
     for lm in hand_landmarks:
         features.extend([
             (lm.x - wrist.x) / scale,
@@ -186,7 +212,6 @@ def get_hand_center_x(hand_points):
 
 def get_two_hand_frame(all_hand_landmarks):
     hands = []
-
     for hand_landmarks in all_hand_landmarks:
         hands.append(raw_landmarks(hand_landmarks))
 
@@ -208,7 +233,6 @@ def sequence_to_features(sequence):
     scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
 
     features = []
-
     for frame in sequence:
         for x, y, z in frame:
             features.extend([
@@ -224,7 +248,6 @@ def sequence_to_phrase_features(sequence):
     first_frame = sequence[0]
 
     visible_points = []
-
     for hand in first_frame:
         if hand is not None:
             visible_points.extend(hand)
@@ -240,7 +263,6 @@ def sequence_to_phrase_features(sequence):
     scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
 
     features = []
-
     for frame in sequence:
         for hand in frame:
             if hand is None:
@@ -288,7 +310,6 @@ def calculate_phrase_movement(sequence):
     first_frame = sequence[0]
 
     visible_points = []
-
     for hand in first_frame:
         if hand is not None:
             visible_points.extend(hand)
@@ -319,13 +340,13 @@ def calculate_phrase_movement(sequence):
 
     return max_dist
 
+
 # ─────────────────────────────
 # Prediction Helpers
 # ─────────────────────────────
 def get_stable_prediction(history):
     if not history:
         return ""
-
     most_common = Counter(history).most_common(1)
     return most_common[0][0]
 
@@ -368,40 +389,6 @@ def predict_phrase_motion(classifier, sequence):
 
     return label, confidence
 
-# ─────────────────────────────
-# Menu Helpers
-# ─────────────────────────────
-def is_finger_up(hand_landmarks, tip_id, pip_id):
-    return hand_landmarks[tip_id].y < hand_landmarks[pip_id].y
-
-
-def detect_menu_option(hand_landmarks):
-    index_up = is_finger_up(hand_landmarks, 8, 6)
-    middle_up = is_finger_up(hand_landmarks, 12, 10)
-    ring_up = is_finger_up(hand_landmarks, 16, 14)
-    pinky_up = is_finger_up(hand_landmarks, 20, 18)
-
-    if index_up and not middle_up and not ring_up and not pinky_up:
-        return "1"
-
-    if index_up and middle_up and not ring_up and not pinky_up:
-        return "2"
-
-    if index_up and middle_up and ring_up and not pinky_up:
-        return "3"
-
-    return ""
-
-
-def detect_menu_option_from_hands(all_hand_landmarks):
-    for hand_landmarks in all_hand_landmarks:
-        option = detect_menu_option(hand_landmarks)
-
-        if option:
-            return option
-
-    return ""
-
 
 def clear_all_buffers():
     alphabet_history.clear()
@@ -409,12 +396,12 @@ def clear_all_buffers():
     phrase_history.clear()
     motion_buffer.clear()
 
+
 # ─────────────────────────────
 # Drawing Helpers
 # ─────────────────────────────
 def draw_hand(frame, hand_landmarks, width, height):
     points = []
-
     for lm in hand_landmarks:
         x, y = int(lm.x * width), int(lm.y * height)
         points.append((x, y))
@@ -425,109 +412,13 @@ def draw_hand(frame, hand_landmarks, width, height):
             cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
 
 
-def draw_menu(frame, selected_option, progress):
-    cv2.rectangle(frame, (20, 20), (780, 310), (0, 0, 0), -1)
-
-    cv2.putText(
-        frame,
-        "FILIPINO SIGN LANGUAGE DETECTOR",
-        (40, 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        "Show hand sign 1, 2, or 3 to choose a mode",
-        (40, 105),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        "Option 1 - FSL Alphabet",
-        (60, 160),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        "Option 2 - FSL Numbers 0-9",
-        (60, 205),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        "Option 3 - FSL Words / Phrases",
-        (60, 250),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        (0, 255, 0),
-        2
-    )
-
-    if selected_option:
-        cv2.putText(
-            frame,
-            f"Selecting Option {selected_option}... {progress:.0f}%",
-            (40, 295),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
-        )
-    else:
-        cv2.putText(
-            frame,
-            "Press Q to quit",
-            (40, 295),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
-        )
-
-
-def draw_mode_header(frame, mode_name):
-    cv2.rectangle(frame, (20, 20), (940, 90), (0, 0, 0), -1)
-
-    cv2.putText(
-        frame,
-        f"Mode: {mode_name}",
-        (40, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.85,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        "Press M for menu | Press Q to quit",
-        (560, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 255, 255),
-        2
-    )
-
 # ─────────────────────────────
-# Main App
+# Camera + Detection Loop
 # ─────────────────────────────
-def main():
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+def camera_loop():
+    global last_motion_letter, last_motion_time
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -536,114 +427,53 @@ def main():
         return
 
     frame_count = 0
-    current_mode = MODE_MENU
 
-    menu_candidate = ""
-    menu_candidate_start = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
 
-    last_motion_letter = ""
-    last_motion_time = 0
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
 
-    with HandLandmarker.create_from_options(options) as landmarker:
-        while True:
-            ret, frame = cap.read()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
 
-            if not ret:
-                print("Failed to read camera.")
-                break
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            frame = cv2.flip(frame, 1)
-            h, w, _ = frame.shape
+        timestamp_ms = frame_count * 33
+        frame_count += 1
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb = np.ascontiguousarray(rgb)
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb
-            )
+        hand_landmarks = None
+        all_hand_landmarks = []
 
-            timestamp_ms = frame_count * 33
-            frame_count += 1
+        if result.hand_landmarks:
+            all_hand_landmarks = result.hand_landmarks
+            hand_landmarks = all_hand_landmarks[0]
 
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            for one_hand_landmarks in all_hand_landmarks:
+                draw_hand(frame, one_hand_landmarks, w, h)
 
-            hand_landmarks = None
-            all_hand_landmarks = []
-            detected_hands = 0
+        with state_lock:
+            current_mode = state["fsl_mode"]
 
-            if result.hand_landmarks:
-                all_hand_landmarks = result.hand_landmarks
-                detected_hands = len(all_hand_landmarks)
-                hand_landmarks = all_hand_landmarks[0]
+        final_label = None
 
-                for one_hand_landmarks in all_hand_landmarks:
-                    draw_hand(frame, one_hand_landmarks, w, h)
+        # ── ALPHABET MODE ──
+        if current_mode == MODE_ALPHABET:
+            if hand_landmarks is not None:
+                motion_buffer.append(raw_landmarks(hand_landmarks))
 
-                if current_mode == MODE_ALPHABET:
-                    motion_buffer.append(raw_landmarks(hand_landmarks))
+            if hand_landmarks is not None and alphabet_classifier is not None:
+                static_letter, static_confidence = predict_static(alphabet_classifier, hand_landmarks)
 
-                elif current_mode == MODE_PHRASES:
-                    motion_buffer.append(get_two_hand_frame(all_hand_landmarks))
+                if static_confidence >= STATIC_CONFIDENCE_THRESHOLD:
+                    alphabet_history.append(static_letter)
 
-            # ─────────────────────────────
-            # MENU MODE
-            # ─────────────────────────────
-            if current_mode == MODE_MENU:
-                selected_option = ""
-                progress = 0
-
-                if all_hand_landmarks:
-                    detected_option = detect_menu_option_from_hands(all_hand_landmarks)
-
-                    if detected_option:
-                        if detected_option != menu_candidate:
-                            menu_candidate = detected_option
-                            menu_candidate_start = time.time()
-                        else:
-                            elapsed = time.time() - menu_candidate_start
-                            progress = min((elapsed / MENU_HOLD_SECONDS) * 100, 100)
-
-                            if elapsed >= MENU_HOLD_SECONDS:
-                                if detected_option == "1":
-                                    current_mode = MODE_ALPHABET
-                                    print("Alphabet mode selected.")
-
-                                elif detected_option == "2":
-                                    current_mode = MODE_NUMBERS
-                                    print("Numbers mode selected.")
-
-                                elif detected_option == "3":
-                                    current_mode = MODE_PHRASES
-                                    print("Phrases mode selected.")
-
-                                clear_all_buffers()
-                                menu_candidate = ""
-                                menu_candidate_start = 0
-                    else:
-                        menu_candidate = ""
-                        menu_candidate_start = 0
-                else:
-                    menu_candidate = ""
-                    menu_candidate_start = 0
-
-                selected_option = menu_candidate
-                draw_menu(frame, selected_option, progress)
-
-            # ─────────────────────────────
-            # ALPHABET MODE
-            # ─────────────────────────────
-            elif current_mode == MODE_ALPHABET:
-                draw_mode_header(frame, "FSL Alphabet")
-
-                static_letter = ""
-                static_confidence = 0.0
-
-                motion_letter = ""
-                motion_confidence = 0.0
-                movement_score = 0.0
-
-                final_letter = ""
+                final_label = get_stable_prediction(alphabet_history)
 
                 now = time.time()
                 motion_hold_active = (
@@ -651,300 +481,149 @@ def main():
                     and now - last_motion_time <= MOTION_HOLD_SECONDS
                 )
 
-                if hand_landmarks is not None:
-                    static_letter, static_confidence = predict_static(
-                        alphabet_classifier,
-                        hand_landmarks
-                    )
+                if motion_hold_active:
+                    final_label = last_motion_letter
+                elif motion_classifier is not None and len(motion_buffer) == SEQUENCE_LENGTH:
+                    sequence = list(motion_buffer)
+                    movement_score = calculate_movement(sequence)
 
-                    if static_confidence >= STATIC_CONFIDENCE_THRESHOLD:
-                        alphabet_history.append(static_letter)
+                    if movement_score >= MOTION_MOVEMENT_THRESHOLD:
+                        motion_letter, motion_confidence = predict_motion(motion_classifier, sequence)
+                        motion_letter = str(motion_letter).upper().strip()
 
-                    stable_letter = get_stable_prediction(alphabet_history)
-                    final_letter = stable_letter
+                        if motion_letter != "NONE" and motion_confidence >= MOTION_CONFIDENCE_THRESHOLD:
+                            last_motion_letter = motion_letter
+                            last_motion_time = time.time()
+                            final_label = motion_letter
 
-                    if motion_hold_active:
-                        final_letter = last_motion_letter
-                    else:
-                        if motion_classifier is not None and len(motion_buffer) == SEQUENCE_LENGTH:
-                            sequence = list(motion_buffer)
-                            movement_score = calculate_movement(sequence)
+                            alphabet_history.clear()
+                            motion_buffer.clear()
+            else:
+                alphabet_history.clear()
+                motion_buffer.clear()
 
-                            if movement_score >= MOTION_MOVEMENT_THRESHOLD:
-                                motion_letter, motion_confidence = predict_motion(
-                                    motion_classifier,
-                                    sequence
-                                )
+        # ── NUMBERS MODE ──
+        elif current_mode == MODE_NUMBERS:
+            if hand_landmarks is not None and number_classifier is not None:
+                number_label, number_confidence = predict_static(number_classifier, hand_landmarks)
 
-                                motion_letter = str(motion_letter).upper().strip()
+                if number_confidence >= NUMBER_CONFIDENCE_THRESHOLD:
+                    number_history.append(number_label)
 
-                                if motion_letter != "NONE" and motion_confidence >= MOTION_CONFIDENCE_THRESHOLD:
-                                    last_motion_letter = motion_letter
-                                    last_motion_time = time.time()
+                final_label = get_stable_prediction(number_history)
+            else:
+                number_history.clear()
 
-                                    final_letter = motion_letter
+        # ── PHRASES MODE ──
+        elif current_mode == MODE_PHRASES:
+            if hand_landmarks is not None:
+                motion_buffer.append(get_two_hand_frame(all_hand_landmarks))
 
-                                    alphabet_history.clear()
-                                    motion_buffer.clear()
-                else:
-                    alphabet_history.clear()
+            if phrase_classifier is not None and phrase_model_compatible:
+                if hand_landmarks is not None and len(motion_buffer) == SEQUENCE_LENGTH:
+                    sequence = list(motion_buffer)
+                    movement_score = calculate_phrase_movement(sequence)
+
+                    if movement_score >= PHRASE_MOVEMENT_THRESHOLD:
+                        raw_label, phrase_confidence = predict_phrase_motion(phrase_classifier, sequence)
+                        raw_label = str(raw_label).upper().strip()
+
+                        if phrase_confidence >= PHRASE_CONFIDENCE_THRESHOLD:
+                            if raw_label == "NONE":
+                                phrase_history.clear()
+                            else:
+                                phrase_history.append(raw_label)
+
                     motion_buffer.clear()
-                    final_letter = ""
 
-                cv2.rectangle(frame, (20, 110), (700, 260), (0, 0, 0), -1)
+                elif hand_landmarks is None:
+                    phrase_history.clear()
+                    motion_buffer.clear()
 
-                cv2.putText(
-                    frame,
-                    f"Detected Letter: {final_letter}",
-                    (40, 160),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (0, 255, 0),
-                    3
-                )
+                detected_phrase = get_stable_prediction(phrase_history)
+                final_label = detected_phrase.replace("_", " ") if detected_phrase else ""
 
-                cv2.putText(
-                    frame,
-                    f"Static Confidence: {static_confidence:.2f}",
-                    (40, 205),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75,
-                    (0, 255, 0),
-                    2
-                )
+        # ── Encode frame for streaming ──
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if not ok:
+            continue
+        frame_b64 = base64.b64encode(buf).decode("utf-8")
 
-                cv2.putText(
-                    frame,
-                    f"Motion: {motion_letter} {motion_confidence:.2f} | Move: {movement_score:.2f}",
-                    (40, 240),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (0, 255, 0),
-                    2
-                )
+        with state_lock:
+            state["frame_jpeg_b64"] = frame_b64
+            if final_label is not None and final_label != "" and final_label != state["fsl_label"]:
+                state["fsl_label"] = final_label
 
-            # ─────────────────────────────
-            # NUMBERS MODE
-            # ─────────────────────────────
-            elif current_mode == MODE_NUMBERS:
-                draw_mode_header(frame, "FSL Numbers 0-9")
-
-                detected_number = ""
-                number_confidence = 0.0
-
-                if number_classifier is None:
-                    cv2.rectangle(frame, (20, 110), (900, 230), (0, 0, 0), -1)
-
-                    cv2.putText(
-                        frame,
-                        "Number model not found.",
-                        (40, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (0, 0, 255),
-                        2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        "Create and train models/numbers/fsl_number_model.joblib first.",
-                        (40, 205),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.70,
-                        (0, 255, 255),
-                        2
-                    )
-
-                else:
-                    if hand_landmarks is not None:
-                        number_label, number_confidence = predict_static(
-                            number_classifier,
-                            hand_landmarks
-                        )
-
-                        if number_confidence >= NUMBER_CONFIDENCE_THRESHOLD:
-                            number_history.append(number_label)
-
-                        detected_number = get_stable_prediction(number_history)
-                    else:
-                        number_history.clear()
-
-                    cv2.rectangle(frame, (20, 110), (650, 220), (0, 0, 0), -1)
-
-                    cv2.putText(
-                        frame,
-                        f"Detected Number: {detected_number}",
-                        (40, 165),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2,
-                        (0, 255, 0),
-                        3
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"Confidence: {number_confidence:.2f}",
-                        (40, 205),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75,
-                        (0, 255, 0),
-                        2
-                    )
-
-            # ─────────────────────────────
-            # PHRASES MODE
-            # ─────────────────────────────
-            elif current_mode == MODE_PHRASES:
-                draw_mode_header(frame, "FSL Words / Phrases")
-
-                detected_phrase = ""
-                phrase_confidence = 0.0
-                movement_score = 0.0
-                raw_phrase_label = ""
-
-                if phrase_classifier is None:
-                    cv2.rectangle(frame, (20, 110), (900, 250), (0, 0, 0), -1)
-
-                    cv2.putText(
-                        frame,
-                        "Phrase model not found.",
-                        (40, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (0, 0, 255),
-                        2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        "Create and train models/phrases/fsl_phrase_model.joblib first.",
-                        (40, 205),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (0, 255, 255),
-                        2
-                    )
-
-                elif not phrase_model_compatible:
-                    cv2.rectangle(frame, (20, 110), (1060, 285), (0, 0, 0), -1)
-
-                    cv2.putText(
-                        frame,
-                        "Phrase model format is old/incompatible.",
-                        (40, 160),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.90,
-                        (0, 0, 255),
-                        2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        "Recollect phrase data using the 2-hand collect_phrase_data.py.",
-                        (40, 205),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (0, 255, 255),
-                        2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        "Then run train_phrase_model.py again.",
-                        (40, 245),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (0, 255, 255),
-                        2
-                    )
-
-                else:
-                    if hand_landmarks is not None and len(motion_buffer) == SEQUENCE_LENGTH:
-                        sequence = list(motion_buffer)
-                        movement_score = calculate_phrase_movement(sequence)
-
-                        if movement_score >= PHRASE_MOVEMENT_THRESHOLD:
-                            raw_phrase_label, phrase_confidence = predict_phrase_motion(
-                                phrase_classifier,
-                                sequence
-                            )
-
-                            raw_phrase_label = str(raw_phrase_label).upper().strip()
-
-                            if phrase_confidence >= PHRASE_CONFIDENCE_THRESHOLD:
-                                if raw_phrase_label == "NONE":
-                                    phrase_history.clear()
-                                else:
-                                    phrase_history.append(raw_phrase_label)
-
-                        motion_buffer.clear()
-
-                    elif hand_landmarks is None:
-                        phrase_history.clear()
-                        motion_buffer.clear()
-
-                    detected_phrase = get_stable_prediction(phrase_history)
-                    display_phrase = detected_phrase.replace("_", " ")
-
-                    cv2.rectangle(frame, (20, 110), (930, 295), (0, 0, 0), -1)
-
-                    cv2.putText(
-                        frame,
-                        f"Detected Phrase: {display_phrase}",
-                        (40, 165),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0,
-                        (0, 255, 0),
-                        3
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"Raw: {raw_phrase_label} | Confidence: {phrase_confidence:.2f}",
-                        (40, 210),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.70,
-                        (0, 255, 0),
-                        2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"Movement Score: {movement_score:.2f} | Hands: {detected_hands}",
-                        (40, 245),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.70,
-                        (0, 255, 0),
-                        2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        "For 2-hand phrases, make sure both hands are visible.",
-                        (40, 280),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.60,
-                        (0, 255, 255),
-                        2
-                    )
-
-            cv2.imshow("FSL Detector Menu System", frame)
-
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord("q"):
-                break
-
-            if key == ord("m"):
-                current_mode = MODE_MENU
-                clear_all_buffers()
-                menu_candidate = ""
-                menu_candidate_start = 0
-                print("Returned to main menu.")
-
-    cap.release()
-    cv2.destroyAllWindows()
+        time.sleep(0.01)
 
 
+# ─────────────────────────────
+# Routes
+# ─────────────────────────────
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/get_state")
+def get_state():
+    with state_lock:
+        return jsonify({
+            "fsl_mode_current": state["fsl_mode"],
+            "fsl_label": state["fsl_label"],
+        })
+
+
+@app.route("/set_fsl_mode", methods=["POST"])
+def set_fsl_mode():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "")
+
+    if mode not in VALID_MODES:
+        return jsonify({"ok": False, "error": "invalid mode"}), 400
+
+    with state_lock:
+        state["fsl_mode"] = mode
+        state["fsl_label"] = ""
+
+    clear_all_buffers()
+
+    return jsonify({"ok": True, "mode": mode})
+
+
+@app.route("/stream")
+def stream():
+    def event_stream():
+        with state_lock:
+            init_payload = {
+                "fsl_label": state["fsl_label"],
+                "fsl_mode": state["fsl_mode"],
+            }
+        yield f"event: init\ndata: {json.dumps(init_payload)}\n\n"
+
+        last_label = None
+        while True:
+            with state_lock:
+                frame_b64 = state["frame_jpeg_b64"]
+                label = state["fsl_label"]
+                mode = state["fsl_mode"]
+
+            if frame_b64:
+                yield f"event: frame\ndata: {frame_b64}\n\n"
+
+            if label and label != last_label:
+                payload = {"label": label, "mode": mode}
+                yield f"event: fsl\ndata: {json.dumps(payload)}\n\n"
+                last_label = label
+
+            time.sleep(0.05)
+
+    return Response(event_stream(), mimetype="text/event-stream")
+
+
+# ─────────────────────────────
 if __name__ == "__main__":
-    main()
+    worker_thread = threading.Thread(target=camera_loop, daemon=True)
+    worker_thread.start()
+
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
